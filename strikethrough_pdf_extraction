@@ -1,61 +1,75 @@
-from wand.image import Image
-from wand.color import Color
-import numpy as np
 import cv2
+import numpy as np
 import pytesseract
 from pytesseract import Output
+import re
+from pdf2image import convert_from_path
 
-def extract_texts_from_pdf_wand(pdf_path, non_striked_file, striked_file):
+def extract_texts_from_pdf_poppler(pdf_path, non_striked_file, striked_file):
     non_striked_text = []
     striked_text = []
+    current_line = []
+    last_y = None
 
-    with Image(filename=pdf_path, resolution=300) as pdf:
-        for page_num, page in enumerate(pdf.sequence):
-            with Image(page) as img:
-                img.background_color = Color('white')
-                img.alpha_channel = 'remove'
+    pages = convert_from_path(pdf_path, 300)
 
-                img_buffer = np.asarray(bytearray(img.make_blob('JPEG')), dtype=np.uint8)
-                gray = cv2.imdecode(img_buffer, cv2.IMREAD_GRAYSCALE)
+    for page_num, page in enumerate(pages):
+        gray = cv2.cvtColor(np.array(page), cv2.COLOR_BGR2GRAY)
 
-                _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-                horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-                detected_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-                contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                d = pytesseract.image_to_data(gray, output_type=Output.DICT)
-                
-                for i, word in enumerate(d['text']):
-                    if word.strip():
-                        x, y, w, h = d['left'][i], d['top'][i], d['width'][i], d['height'][i]
-                        text_box = np.array([x, y, x+w, y+h])
-                        strike_through = False
-                        
-                        for cnt in contours:
-                            x, y, w, h = cv2.boundingRect(cnt)
-                            line_box = np.array([x, y, x+w, y+h])
-                            
-                            if (text_box[0] < line_box[2] and text_box[2] > line_box[0] and
-                                text_box[1] < line_box[3] and text_box[3] > line_box[1]):
-                                strike_through = True
-                                striked_text.append(f"{word}|{page_num + 1}")
-                                break
-                        
-                        if not strike_through:
-                            non_striked_text.append(word)
+        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+        detected_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+        contours, _ = cv2.findContours(detected_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        custom_config = r'--oem 3 --psm 6'
+        d = pytesseract.image_to_data(gray, output_type=Output.DICT, config=custom_config)
+        phone_pattern = re.compile(r'\(\d{3}\)\s*\d{3}-\d{4}')
+
+        for i, word in enumerate(d['text']):
+            if word.strip():
+                x, y, w, h = d['left'][i], d['top'][i], d['width'][i], d['height'][i]
+                text_box = np.array([x, y, x+w, y+h])
+                strike_through = False
+
+                if last_y is None or abs(y - last_y) > h:
+                    if current_line:
+                        non_striked_text.append(" ".join(current_line))
+                        current_line = []
+                    last_y = y
+
+                for cnt in contours:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    line_box = np.array([x, y, x+w, y+h])
+
+                    if (text_box[0] < line_box[2] and text_box[2] > line_box[0] and
+                        text_box[1] < line_box[3] and text_box[3] > line_box[1]):
+                        strike_through = True
+                        striked_text.append(f"{word}|{page_num + 1}")
+                        break
+
+                if not strike_through:
+                    current_line.append(word)
+
+        if current_line:
+            non_striked_text.append(" ".join(current_line))
+
+        full_text = pytesseract.image_to_string(gray, config=custom_config)
+        phones = phone_pattern.findall(full_text)
+        non_striked_text.extend(phones)
 
     with open(non_striked_file, 'w') as file:
-        file.write(' '.join(non_striked_text))
-    
+        file.write('\n'.join(non_striked_text))
+
     with open(striked_file, 'w') as file:
         file.write('\n'.join(striked_text))
-    
+
     return non_striked_file, striked_file
 
 # Call the function with your PDF
-non_striked_file, striked_file = extract_texts_from_pdf_wand(
-    'names_numbers.pdf', 
-    'non_striked_text_wand_names_numbers.txt', 
-    'striked_text_wand_names_numbers.txt'
+non_striked_file, striked_file = extract_texts_from_pdf_poppler(
+    'pdf.pdf', 
+    'non_striked_text.txt', 
+    'striked_text.txt'
 )
 
 print(f"Non-striked text saved to: {non_striked_file}")
